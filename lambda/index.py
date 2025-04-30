@@ -1,46 +1,47 @@
-# lambda/index.py
+# fastapi/index.py
 import json
 import os
+import re
+from typing import List, Dict, Optional
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
 import boto3
-import re  # 正規表現モジュールをインポート
 from botocore.exceptions import ClientError
 
+# FastAPIアプリケーションの初期化
+app = FastAPI()
 
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
-
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
+# CORSミドルウェアの追加
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # モデルID
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
 
-def lambda_handler(event, context):
+# リクエスト用のPydanticモデル
+class ChatRequest(BaseModel):
+    message: str
+    conversationHistory: Optional[List[Dict[str, str]]] = []
+
+# レスポンス用のPydanticモデル
+class ChatResponse(BaseModel):
+    success: bool
+    response: Optional[str] = None
+    conversationHistory: Optional[List[Dict[str, str]]] = None
+    error: Optional[str] = None
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
-        print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
-        user_info = None
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
-        # リクエストボディの解析
-        body = json.loads(event['body'])
-        message = body['message']
-        conversation_history = body.get('conversationHistory', [])
+        message = request.message
+        conversation_history = request.conversationHistory or []
         
         print("Processing message:", message)
         print("Using model:", MODEL_ID)
@@ -54,59 +55,92 @@ def lambda_handler(event, context):
             "content": message
         })
         
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
+        # FastAPIを使用したLLM呼び出し処理
+        # ここで外部APIまたはローカルモデルを呼び出します
+        async with httpx.AsyncClient() as client:
+            # FastAPIで提供されるAPIエンドポイントを呼び出す
+            # 例: http://localhost:8000/api/llm
+            bedrock_messages = []
+            for msg in messages:
+                if msg["role"] == "user":
+                    bedrock_messages.append({
+                        "role": "user",
+                        "content": [{"text": msg["content"]}]
+                    })
+                elif msg["role"] == "assistant":
+                    bedrock_messages.append({
+                        "role": "assistant", 
+                        "content": [{"text": msg["content"]}]
+                    })
+            
+            # LLM APIへのリクエストペイロード
+            request_payload = {
+                "messages": bedrock_messages,
+                "inferenceConfig": {
+                    "maxTokens": 512,
+                    "stopSequences": [],
+                    "temperature": 0.7,
+                    "topP": 0.9
+                }
             }
-        }
+            
+            print("Calling LLM API with payload:", json.dumps(request_payload))
+            
+            # FastAPIのLLMエンドポイントを呼び出す
+            response = await client.post(
+                "http://localhost:8000/api/llm",  # APIエンドポイントを適切に設定
+                json=request_payload,
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="LLM API returned an error")
+            
+            # レスポンスを解析
+            response_data = response.json()
+            
+            # 応答の検証
+            if not response_data.get('output') or not response_data['output'].get('message') or not response_data['output']['message'].get('content'):
+                raise Exception("No response content from the model")
+            
+            # アシスタントの応答を取得
+            assistant_response = response_data['output']['message']['content'][0]['text']
+            
+            # アシスタントの応答を会話履歴に追加
+            messages.append({
+                "role": "assistant",
+                "content": assistant_response
+            })
+            
+            # 成功レスポンスの返却
+            return ChatResponse(
+                success=True,
+                response=assistant_response,
+                conversationHistory=messages
+            )
         
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+    except Exception as error:
+        print("Error:", str(error))
+        return ChatResponse(
+            success=False,
+            error=str(error)
         )
+
+# オプション: 同期APIのサポート（Lambdaの互換性のため）
+def lambda_handler(event, context):
+    """
+    Lambda互換のハンドラー関数
+    FastAPIアプリケーションから呼び出すこともできます
+    """
+    try:
+        # リクエストボディの解析
+        body = json.loads(event['body'])
+        request = ChatRequest(**body)
         
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
+        # FastAPIエンドポイントを同期的に呼び出す
+        import asyncio
+        response = asyncio.run(chat(request))
         
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
         return {
             "statusCode": 200,
             "headers": {
@@ -115,11 +149,7 @@ def lambda_handler(event, context):
                 "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
                 "Access-Control-Allow-Methods": "OPTIONS,POST"
             },
-            "body": json.dumps({
-                "success": True,
-                "response": assistant_response,
-                "conversationHistory": messages
-            })
+            "body": json.dumps(response.dict())
         }
         
     except Exception as error:
@@ -138,3 +168,7 @@ def lambda_handler(event, context):
                 "error": str(error)
             })
         }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
