@@ -23,7 +23,7 @@ app.add_middleware(
 )
 
 # モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+MODEL_ID = "https://9d77-34-138-193-2.ngrok-free.app"
 
 # リクエスト用のPydanticモデル
 class ChatRequest(BaseModel):
